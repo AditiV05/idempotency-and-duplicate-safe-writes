@@ -139,3 +139,42 @@ Submit pull-request URL, not repository homepage, branch, commit, or PDF link.
 **Tests say idempotency table is missing:** implement schema TODOs and rerun reset before tests.
 
 **Resetting production data:** never point `DATABASE_URL` at shared or production database. Reset script is destructive.
+
+## Design Decisions
+
+### 1. Why database uniqueness is needed
+
+A check before the write is not enough, because 20 requests can all read "key not seen" and then all write. The primary key on `(tenant_id, operation, key)` decides the one owner atomically. The claim is an `INSERT ... ON CONFLICT` that runs before the incident is created. A concurrent duplicate waits for the owner to commit, then reads the completed record and replays it. If the owner is stuck, `lock_timeout` stops the wait after 5 seconds and the caller gets `409 operation_in_progress`.
+
+The tenant comes from the authenticated user, never from the request body, so two tenants can use the same key without colliding. The operation is stored as `POST:/incidents`.
+
+| Situation | Response |
+|---|---|
+| Key missing | `400 idempotency_key_required` |
+| New key | `201`, creates the incident and paging job |
+| Same key, same request, completed | The stored `201`, with `Idempotent-Replayed: true` |
+| Same key, changed request | `409 idempotency_key_conflict` |
+| Same key, still processing | `409 operation_in_progress` |
+| Same key, marked failed | `409 prior_operation_failed` |
+
+The handler does its whole write in one transaction, so it never commits `processing` or `failed` itself. If the write fails, everything rolls back, including the key, and a retry runs cleanly. Those two states are still honoured if a record holds them, such as one written by a future multi-step flow or by an operator.
+
+### 2. How request contents are canonicalised and compared
+
+Only `title`, `severity`, and `serviceId` define the action. `title` is trimmed and `serviceId` is lowercased, because those differences do not change the meaning. The three values go into an array in a fixed order, and the SHA-256 of that JSON is stored as `request_hash`. So property order and extra fields do not change the hash, while a changed title, severity, or service does. Validation runs before the claim, so a rejected request does not use up its key.
+
+### 3. What 24-hour expiry means
+
+A key protects against duplicates for 24 hours after it is claimed. After that, the same key is treated as new: the claim takes over the expired record atomically and creates a new incident, even if the body changed. So a client must not retry an old request after 24 hours and expect a replay.
+
+Expired records stay in the table until something removes them. This exercise has no cleanup job, and production would need a scheduled delete.
+
+### 4. Why the paging job is stored in the same transaction
+
+The key, the incident, the paging job, and the completed response commit together or not at all. Otherwise, a crash could leave an incident with no page, or a page for an incident that does not exist. A database transaction cannot include an outside call, so the handler never calls a provider. It stores a job row, and a worker sends the page after commit. `paging_jobs.incident_id` is unique, so an incident has only one job, and the job `id` is a stable identity the provider call can use to stay safe to repeat. This exercise does not include the worker.
+
+### 5. Privacy and size risks of stored responses
+
+Each completed key keeps a full copy of the response for 24 hours or more, and it includes the incident title. A title can contain sensitive details, so this copy has the same access rules as the incident: it is only readable within the same tenant and key. It also keeps old data after the incident changes, so a replay shows the result as it was first returned, and deleting an incident does not remove this copy.
+
+For size, each record is small, but a title has no length limit beyond Express's default 100 KB body limit, and rows build up until they are cleaned up. A production version should limit title length, delete expired records on a schedule, and avoid storing anything a replay does not need.
